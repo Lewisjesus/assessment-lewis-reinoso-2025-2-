@@ -1,0 +1,250 @@
+trigger:
+  branches:
+    include:
+    - dev
+    - qa
+    - main
+
+# Definimos parámetros para hacer el pipeline más flexible
+parameters:
+- name: environment
+  displayName: Environment
+  type: string
+  default: dev
+  values:
+  - dev
+  - qa
+  - prod
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  terraformVersion: '1.11.1'  # Versión específica de Terraform
+  ${{ if eq(parameters.environment, 'dev') }}:
+    bucketName: 'api-d1-dev'
+    stateKey: 'statetf/terraform.tfstate'
+    tfvarsFile: 'terraform.dev.tfvars'
+    awsConnection: 'aws_terraform_dev'
+    sourceBranch: 'refs/heads/dev'
+    awsRegion: 'us-east-1'
+  ${{ if eq(parameters.environment, 'qa') }}:
+    bucketName: 'api-d1-qa'
+    stateKey: 'statetf/terraform.tfstate'
+    tfvarsFile: 'terraform.qa.tfvars'
+    awsConnection: 'aws_terraform_qa'
+    sourceBranch: 'refs/heads/qa'
+    awsRegion: 'us-east-1'
+  ${{ if eq(parameters.environment, 'prod') }}:
+    bucketName: 'api-d1-prod'
+    stateKey: 'statetf/terraform.tfstate'
+    tfvarsFile: 'terraform.prod.tfvars'
+    awsConnection: 'aws_terraform_prod'
+    sourceBranch: 'refs/heads/main'
+    awsRegion: 'us-east-1'
+
+stages:
+- stage: Terraform_plan
+  jobs:
+    - job: Plan
+      continueOnError: false
+      steps:
+      
+      # Instalar versión específica de Terraform
+      - task: TerraformInstaller@1
+        inputs:
+          terraformVersion: '$(terraformVersion)'
+        displayName: 'Install Terraform $(terraformVersion)'
+
+      # Configurar variables de entorno de forma dinámica
+      - task: Bash@3
+        inputs:
+          targetType: 'inline'
+          script: |
+            # Imprime información del entorno actual
+            echo "Deploying to environment: ${{ parameters.environment }}"
+            echo "Using bucket: $(bucketName)"
+            echo "Using state key: $(stateKey)"
+            echo "Using tfvars file: $(tfvarsFile)"
+            echo "Expected source branch: $(sourceBranch)"
+            echo "Current source branch: $(Build.SourceBranch)"
+        displayName: 'Configure Environment'
+
+      # Inicialización de Terraform con el Service Connection de AWS
+      - task: TerraformTaskV4@4
+        inputs:
+          provider: 'aws'
+          command: 'init'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+          backendServiceAWS: '$(awsConnection)'
+          backendAWSBucketName: '$(bucketName)'
+          backendAWSKey: '$(stateKey)'
+        displayName: 'Terraform init'
+        
+      # Validación de Terraform
+      - task: Bash@3
+        inputs:
+          targetType: 'inline'
+          script: |
+            set -e
+            # Verificar versión de Terraform
+            terraform --version
+            terraform validate
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+        displayName: 'Terraform validate'
+
+      # Descargar archivo de variables seguras según el ambiente
+      - task: DownloadSecureFile@1
+        name: varsFile
+        inputs:
+          secureFile: '$(tfvarsFile)'
+        displayName: 'Descargar Variables Seguras'
+      
+      # Backup del Terraform State desde S3 (solo si existe)
+      - task: Bash@3
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Verificando si terraform.tfstate existe en S3..."
+            if aws s3 ls s3://$(bucketName)/$(stateKey) --region us-east-1; then
+              aws s3 cp s3://$(bucketName)/$(stateKey) $(System.DefaultWorkingDirectory)/infrastructure/terraform.tfstate
+              echo "Backup creado exitosamente."
+            else
+              echo "El archivo terraform.tfstate no existe aún, omitiendo backup."
+            fi
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+        displayName: 'Backup Current State'
+      
+      # Terraform Plan con Service Connection
+      - task: TerraformTaskV4@4
+        inputs:
+          provider: 'aws'
+          command: 'plan'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+          commandOptions: '-var-file $(varsFile.secureFilePath) -var environment=${{ parameters.environment }} -out plan.out'
+          environmentServiceNameAWS: '$(awsConnection)'
+        displayName: 'Terraform Plan'
+      
+      # Publicación del Plan como Artifact
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(System.DefaultWorkingDirectory)/infrastructure/plan.out'
+          artifact: 'Plan-${{ parameters.environment }}'
+          publishLocation: 'pipeline'
+        displayName: 'Publish Plan Artifact'
+
+# Stage de aprobación para TODOS los ambientes
+- stage: Approval
+  dependsOn: Terraform_plan
+  jobs:
+    - job: WaitForValidation
+      pool: server
+      timeoutInMinutes: 15
+      steps:
+      - task: ManualValidation@0
+        timeoutInMinutes: 15
+        inputs:
+          notifyUsers: |
+            user@example.com
+          instructions: 'Por favor, revisa y aprueba el despliegue para el ambiente ${{ parameters.environment }}'
+          onTimeout: 'reject'
+        displayName: 'Wait for approval'
+
+# Stage de despliegue
+- stage: Terraform_Apply
+  dependsOn:
+  - Terraform_plan
+  - Approval
+  condition: |
+    and(
+      succeeded('Terraform_plan'),
+      succeeded('Approval'),
+      eq(variables['Build.SourceBranch'], variables['sourceBranch'])
+    )
+  jobs:
+    - job: Deploy
+      continueOnError: false
+      steps:
+      
+      # Instalar versión específica de Terraform
+      - task: TerraformInstaller@1
+        inputs:
+          terraformVersion: '$(terraformVersion)'
+        displayName: 'Install Terraform $(terraformVersion)'
+        
+      # Verificar versión instalada
+      - task: Bash@3
+        inputs:
+          targetType: 'inline'
+          script: |
+            terraform --version
+            echo "Deploying to environment: ${{ parameters.environment }}"
+            echo "Current branch: $(Build.SourceBranch)"
+            echo "Expected branch: $(sourceBranch)"
+        displayName: 'Verify Environment'
+        
+      - task: TerraformTaskV4@4
+        inputs:
+          provider: 'aws'
+          command: 'init'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+          backendServiceAWS: '$(awsConnection)'
+          backendAWSBucketName: '$(bucketName)'
+          backendAWSKey: '$(stateKey)'
+        displayName: 'Terraform init'
+
+      - task: DownloadBuildArtifacts@1
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'Plan-${{ parameters.environment }}'
+          downloadPath: '$(System.DefaultWorkingDirectory)/infrastructure'
+        displayName: 'Download Plan Artifact'
+        
+      # Descargar archivo de variables seguras según el ambiente
+      - task: DownloadSecureFile@1
+        name: varsFile
+        inputs:
+          secureFile: '$(tfvarsFile)'
+        displayName: 'Descargar Variables Seguras'
+
+      - task: TerraformTaskV4@4
+        inputs:
+          provider: 'aws'
+          command: 'apply'
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+          commandOptions: 'plan.out'
+          environmentServiceNameAWS: '$(awsConnection)'
+        displayName: 'Terraform Apply'
+        name: terraformApply
+
+      - task: Bash@3
+        condition: failed()
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Iniciando rollback debido a fallo en el despliegue..."
+            # Restaurar el estado anterior
+            if [ -f "$(System.DefaultWorkingDirectory)/infrastructure/terraform.tfstate.backup" ]; then
+              echo "Restaurando estado previo..."
+              cp $(System.DefaultWorkingDirectory)/infrastructure/terraform.tfstate.backup $(System.DefaultWorkingDirectory)/infrastructure/terraform.tfstate
+              terraform init
+              terraform refresh
+              terraform apply
+            else
+              echo "No hay backup disponible, rollback no ejecutado."
+            fi
+          workingDirectory: '$(System.DefaultWorkingDirectory)/infrastructure'
+        displayName: 'Rollback on Failure'
+
+      - task: Bash@3
+        condition: always()
+        inputs:
+          targetType: 'inline'
+          script: |
+            if [ "$(terraformApply.result)" == "Failed" ]; then
+              echo "##vso[task.complete result=Failed;]Deployment failed and rollback was executed"
+            else
+              echo "##vso[task.complete result=Succeeded;]Deployment completed successfully"
+            fi
+        displayName: 'Deployment Status'
